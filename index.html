@@ -241,7 +241,8 @@ function crPath(pts, u) {
 // ============================================================
 let mode = 'cruise';            // 'cruise' | 'combat'
 let guard = false;              // 守护美好 → 战斗无时限
-let combatRemaining = 30 * 60;  // 秒
+let combatEndAt = 0;                  // 战斗结束墙钟时间戳(ms)，!guard 时有效（墙钟计时，切后台不丢）
+let combatRemainMs = 30 * 60 * 1000;  // 守护暂停时存的剩余
 let tint = 0;                   // 0=cruise blue, 1=combat warm (crossfade)
 let ending = 0;                 // 战斗到点提示淡入淡出
 
@@ -936,6 +937,55 @@ const btnCruise = document.getElementById('btn-cruise');
 const btnCombat = document.getElementById('btn-combat');
 const btnGuard = document.getElementById('btn-guard');
 
+// ---- 音频 / 提醒 / 后台保活 / 屏幕常亮（用于战斗倒计时维持与到点提醒）----
+let audioCtx = null, keepNode = null, wakeLock = null;
+function ensureAudio() {
+  if (!audioCtx) { try { audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) {} }
+  if (audioCtx && audioCtx.state === 'suspended') audioCtx.resume();
+}
+function chimeDone() {
+  ensureAudio(); if (!audioCtx) return;
+  const t0 = audioCtx.currentTime, tones = [659, 880, 1175];
+  tones.forEach((f, i) => {
+    const o = audioCtx.createOscillator(), g = audioCtx.createGain();
+    o.type = 'sine'; o.frequency.value = f;
+    g.gain.setValueAtTime(0, t0 + i * 0.16);
+    g.gain.linearRampToValueAtTime(0.3, t0 + i * 0.16 + 0.02);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0 + i * 0.16 + 0.5);
+    o.connect(g).connect(audioCtx.destination);
+    o.start(t0 + i * 0.16); o.stop(t0 + i * 0.16 + 0.55);
+  });
+}
+function vibrate(p) { if (navigator.vibrate) try { navigator.vibrate(p); } catch (e) {} }
+function startKeepAlive() {            // 近无声振荡器，尽量让后台不被挂起（安卓有效，iOS 有限）
+  ensureAudio(); if (!audioCtx || keepNode) return;
+  try {
+    keepNode = audioCtx.createOscillator();
+    const g = audioCtx.createGain(); g.gain.value = 0.0001;
+    keepNode.frequency.value = 40;
+    keepNode.connect(g).connect(audioCtx.destination);
+    keepNode.start();
+  } catch (e) {}
+}
+function stopKeepAlive() { try { if (keepNode) { keepNode.stop(); keepNode.disconnect(); keepNode = null; } } catch (e) {} }
+async function requestWakeLock() { if ('wakeLock' in navigator) { try { wakeLock = await navigator.wakeLock.request('screen'); } catch (e) {} } }
+function releaseWakeLock() { try { if (wakeLock) { wakeLock.release(); wakeLock = null; } } catch (e) {} }
+function combatRemainingSec() {
+  if (mode !== 'combat' || guard || !combatEndAt) return Infinity;
+  return Math.max(0, (combatEndAt - Date.now()) / 1000);
+}
+function checkCombatEnd() {            // 墙钟判定到点（前台/后台/切回 都能触发）
+  if (mode === 'combat' && !guard && combatEndAt && Date.now() >= combatEndAt) {
+    ending = 2.5;
+    chimeDone();
+    vibrate([200, 100, 200, 100, 400]);
+    if ('Notification' in window && Notification.permission === 'granted') {
+      try { new Notification('雨落笙歌起', { body: '时已尽 · 雨复落' }); } catch (e) {}
+    }
+    setMode('cruise');
+  }
+}
+
 function setMode(m) {
   if (m === mode) return;
   const from = mode;
@@ -947,10 +997,14 @@ function setMode(m) {
       rain.state = 'intro'; rain.t = 0; rain.amount = 0.15; rain.speedMul = 0.16;
     }
     setSword(false);
+    stopKeepAlive(); releaseWakeLock();
   } else {
-    combatRemaining = 30 * 60;
+    combatRemainMs = 30 * 60 * 1000;
+    combatEndAt = guard ? 0 : Date.now() + combatRemainMs;   // 墙钟结束点
     rain.state = 'fadeout';
     setSword(true);
+    ensureAudio(); startKeepAlive(); requestWakeLock();
+    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
   }
   btnCruise.classList.toggle('active', m === 'cruise');
   btnCombat.classList.toggle('active', m === 'combat');
@@ -959,6 +1013,10 @@ function setMode(m) {
 function toggleGuard() {
   guard = !guard;
   btnGuard.classList.toggle('active', guard);
+  if (mode === 'combat') {
+    if (guard) { if (combatEndAt) combatRemainMs = combatEndAt - Date.now(); combatEndAt = 0; }   // 暂停倒计时
+    else { combatEndAt = Date.now() + Math.max(0, combatRemainMs); }                                // 恢复倒计时
+  }
 }
 // 底部小字：固定轮回两句（与模式无关）
 const HINTS = ['在下瞳雨 · 赤瞳之雨', '心向美好 · 瞳雨不止'];
@@ -984,20 +1042,12 @@ btnGuard.addEventListener('click', toggleGuard);
 
 let titleHidden = false;
 function updateStatus(dt) {
-  // combat countdown
-  if (mode === 'combat' && !guard) {
-    combatRemaining -= dt;
-    if (combatRemaining <= 0) {
-      combatRemaining = 0;
-      ending = 2.5;
-      setMode('cruise');
-    }
-  }
+  checkCombatEnd();   // 墙钟判定到点（切后台不丢时间）
   let txt = '', cls = '';
   if (mode === 'combat') {
     if (guard) { txt = '守护中 · ∞'; cls = 'guard'; }
     else {
-      const s = Math.max(0, Math.ceil(combatRemaining));
+      const s = Math.max(0, Math.ceil(combatRemainingSec()));
       txt = `战 · ${String(Math.floor(s / 60)).padStart(2, '0')}:${String(s % 60).padStart(2, '0')}`;
     }
   } else if (ending > 0) {
@@ -1051,10 +1101,15 @@ function frame(now) {
 }
 
 // pause when hidden (battery)
-let rafRunning = true;
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'visible') { last = 0; }
+  if (document.visibilityState === 'visible') {
+    last = 0;                 // 重置帧时基，避免回前台跳变
+    checkCombatEnd();         // 切回时立即结算战斗倒计时
+    if (mode === 'combat') requestWakeLock();   // 屏幕常亮会在隐藏时释放，回前台重新申请
+  }
 });
+// 后台看门狗：即使动画帧暂停，也按墙钟判定战斗到点（配合保活在安卓后台可触发提醒）
+setInterval(checkCombatEnd, 1000);
 
 // ---------- init ----------
 resize();
