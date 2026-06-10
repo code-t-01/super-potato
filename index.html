@@ -980,15 +980,40 @@ function drawSword() {
   ctx.stroke();
   ctx.restore();
 
-  // --- travelling glint：刀在外时持续巡走的反光（弹鞘停住时也在闪）---
-  if (!sword.sheathing && sword.t > POP_END * 0.7) {
+  // --- 巡走流光：战斗常驻时，一道亮光沿弯曲镐线从刀根滑向刀尖、滑出尖端，循环往复（慢频率）---
+  if (!sword.sheathing && sword.t > DRAW_END) {
     sword.glint += 0.016;
-    const gp = (sword.glint % 2.2) / 1.0;
-    if (gp <= 1) {
-      const gx2 = lerp(gx, tx, gp), gy2 = lerp(gy, ty, gp);
-      const a = Math.sin(gp * Math.PI);
-      ctx.fillStyle = `rgba(255,255,255,${0.9 * a})`;
-      ctx.beginPath(); ctx.ellipse(gx2 + enx * bw * 0.7, gy2 + eny * bw * 0.7, 3, 6, ang, 0, Math.PI * 2); ctx.fill();
+    const CYC = 3.8, TRAVEL = 1.4, TAIL = 0.12;    // ~3.8s 一轮，滑行 1.4s，彗尾占刃长 12%
+    const ph = sword.glint % CYC;
+    if (ph <= TRAVEL) {
+      const gp = ph / TRAVEL;
+      const head = gp * (1 + TAIL);                 // 头部 0 → 1+TAIL（完整滑出刀尖）
+      const env = smooth(0, 0.12, gp);              // 起步淡入
+      ctx.save();
+      ctx.globalCompositeOperation = 'lighter';
+      ctx.lineCap = 'round';
+      const M = 8, LANE = 0.45;                     // 流光车道：刀身中部钢面（避开常亮的镐线）
+      for (let i = 0; i < M; i++) {                 // 彗星：头亮尾淡（光晕+亮芯两层）
+        let s1 = head - TAIL * (i + 1) / M, s2 = head - TAIL * i / M;
+        s1 = clamp(s1, 0, 1); s2 = clamp(s2, 0, 1);
+        if (s2 - s1 < 1e-4) continue;
+        const c1 = cAt(s1), c2 = cAt(s2);
+        const w1 = off(LANE, s1), w2 = off(LANE, s2);
+        const x1 = c1.x + enx * w1, y1 = c1.y + eny * w1, x2 = c2.x + enx * w2, y2 = c2.y + eny * w2;
+        const fade = (1 - i / M) * env;
+        ctx.strokeStyle = `rgba(225,240,255,${0.30 * fade})`;
+        ctx.lineWidth = 8 - 3 * (i / M);
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+        ctx.strokeStyle = `rgba(255,255,255,${0.9 * fade})`;
+        ctx.lineWidth = 3.4 - 1.8 * (i / M);
+        ctx.beginPath(); ctx.moveTo(x1, y1); ctx.lineTo(x2, y2); ctx.stroke();
+      }
+      if (head <= 1) {                              // 头部亮点
+        const ch = cAt(head), wh = off(LANE, head);
+        ctx.fillStyle = `rgba(255,255,255,${0.95 * env})`;
+        ctx.beginPath(); ctx.arc(ch.x + enx * wh, ch.y + eny * wh, 3.2, 0, Math.PI * 2); ctx.fill();
+      }
+      ctx.restore();
     }
   }
 
