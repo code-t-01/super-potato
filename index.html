@@ -119,6 +119,19 @@ html, body {
   color: #ffeee8;
   box-shadow: 0 0 22px rgba(210,90,70,0.4), inset 0 1px 0 rgba(255,255,255,0.12);
 }
+/* 半亮态：第一段已执行、等待第二次点击（颜色渐变 + 脉冲提示） */
+.mode-btn.half.cruise {
+  background: linear-gradient(180deg, rgba(90,130,180,0.2), rgba(50,80,120,0.16));
+  color: #cfdcf2;
+  box-shadow: 0 0 14px rgba(90,140,200,0.22);
+}
+.mode-btn.half.combat {
+  background: linear-gradient(180deg, rgba(190,90,80,0.22), rgba(130,55,50,0.16));
+  color: #ffd9cd;
+  box-shadow: 0 0 14px rgba(210,90,70,0.22);
+}
+.mode-btn.half { animation: halfPulse 1.3s ease-in-out infinite; }
+@keyframes halfPulse { 0%, 100% { filter: brightness(1); } 50% { filter: brightness(1.4); } }
 
 .guard-btn {
   pointer-events: auto;
@@ -247,7 +260,7 @@ let tint = 0;                   // 0=cruise blue, 1=combat warm (crossfade)
 let ending = 0;                 // 战斗到点提示淡入淡出
 
 const rain = { t: 0, amount: 0.0, speedMul: 0.16, wind: -150, state: 'intro', flash: 0 };
-const sword = { active: false, sheathing: false, t: 0, glint: 0 };
+const sword = { active: false, sheathing: false, t: 0, glint: 0, cap: Infinity };
 
 // ============================================================
 //  STARS / SKY
@@ -522,7 +535,7 @@ function buildDrops() {
   }
 }
 function updateRain(dt) {
-  if (mode === 'combat') {
+  if (rain.state === 'fadeout') {
     rain.amount = approach(rain.amount, 0, dt * 2.2);
   } else if (rain.state === 'awaitSheath') {
     const sp = sword.active ? clamp(sword.t / SHEATH_DUR, 0, 1) : 1;
@@ -673,55 +686,156 @@ function drawBoat(now) {
 // ============================================================
 //  SWORD (combat) — first person, blade forward
 // ============================================================
-function setSword(active) {
-  if (active) { sword.active = true; sword.sheathing = false; sword.t = 0; sword.glint = 0; }
-  else { sword.sheathing = true; sword.t = 0; }
+function setSword(active, cap) {
+  sword.cap = (cap === undefined) ? Infinity : cap;  // 暂停点：t 不超过 cap，第二次点击置 Infinity 续完
+  sword.active = true;
+  sword.sheathing = !active;
+  sword.t = 0; sword.glint = 0;
 }
-// 拔剑路径：出鞘(左) → 举过头顶(高) → 挥下至正前方（CR 连续曲线，apex 在 u=0.667）
+// 刀鞘几何（与 drawScabbard 共用）；收刀时刀身沿此轴线滑入、被加宽的鞘遮挡 = 真正收进去
+const SCAB_M = { x: 0.115, y: 0.80 };  // 鞘口（离开左缘，给加宽加长的刀柄留足空间）
+const SCAB_D = { x: 0.30, y: 1.40 };   // 鞘尾（伸出画面外）
+// 拔剑路径（沿用之前：弹鞘 → 顺时针上挥到头顶 → 挥下正前方）
 const GRIP_PATH = [{ x: 0.00, y: 0.74 }, { x: 0.22, y: 0.70 }, { x: 0.49, y: 0.46 }, { x: 0.64, y: 1.00 }];
 const TIP_PATH  = [{ x: 0.12, y: 0.98 }, { x: 0.03, y: 0.30 }, { x: 0.54, y: -0.12 }, { x: 0.50, y: 0.44 }];
-// 收刀路径：正前方 → 左下方 → 抬手左上·剑指右下对准鞘口 → 入鞘
-const SHEATH_G_PATH = [{ x: 0.64, y: 1.00 }, { x: 0.40, y: 0.86 }, { x: -0.17, y: 0.22 }, { x: 0.06, y: 0.80 }];
-const SHEATH_T_PATH = [{ x: 0.50, y: 0.44 }, { x: 0.12, y: 1.04 }, { x: 0.05, y: 0.80 }, { x: 0.18, y: 1.10 }];
-const SHEATH_G  = { x: 0.06, y: 0.80 };   // 纯鞘中：握柄在鞘口
+const SHEATH_G  = { x: 0.06, y: 0.80 };   // 纯鞘中
 const SHEATH_T  = { x: 0.18, y: 1.10 };
-const DRAW_END = 1.42, SHEATH_DUR = 1.18;
+// 收刀空中弧线关键点
+const ARC_FORWARD  = { gx: 0.64, gy: 1.00, tx: 0.50, ty: 0.44 };
+const ARC_DOWNLEFT = { gx: 0.40, gy: 0.86, tx: 0.12, ty: 1.04 };
 
-// 拔剑速度：抬到头顶 → 顿一下(慢非停) → 用力加速劈下
-function drawEase(dp) {
-  if (dp < 0.46) { const x = dp / 0.46; const e = 1 - (1 - x) * (1 - x) * (1 - x); return 0.667 * (0.82 * e + 0.18 * x); }
-  if (dp < 0.60) { const x = (dp - 0.46) / 0.14; return 0.667 + 0.025 * x; }                 // 顿
-  const x = (dp - 0.60) / 0.40; return 0.692 + 0.308 * (0.75 * x * x * x + 0.25 * x);         // 发力
+const POP_END = 0.30;        // 弹鞘结束（第一次点击停这里）
+const DRAW_END = 2.25;       // 拔剑全程结束
+const EXT_DP   = 0.34;       // ① 轴向滑出段：连续加速（先缓缓掠过"将收未收"高度，再加速抽出，不打顿）
+const APEX_DP  = 0.63;       // ② 出鞘无缝衔接上挥（端速匹配），到头顶收住
+const PAUSE_DP = 0.72;       // ③ 头顶顿到此，之后 ④ 发力斩下
+const EXT_OUT  = 0.50;       // 滑出完成时的外移距离(×H)：上提幅度与鞘的下坠相称
+const POP_OUT  = 0.085;      // 弹鞘弹出量(×H)：露出足够长的刃根给反光
+const DROP_START = 0.18;     // 鞘坠离起点：恰在剑掠过"将收未收"高度之时（与剑上提同时）
+const DROP_END = 0.49;       // 鞘坠离持续到此（加速下坠；可见部分恰在旋转前退出画面）
+const SHEATH_DUR = 1.7;      // 收刀总时长
+const SHEATH_ARC_END = 0.5;  // 收刀空中弧线占比（之后沿轴插入）
+
+function sheathAxis() {
+  const Mx = SCAB_M.x * W, My = SCAB_M.y * H, Dx = SCAB_D.x * W, Dy = SCAB_D.y * H;
+  const dx = Dx - Mx, dy = Dy - My, l = Math.hypot(dx, dy) || 1;
+  return { Mx, My, ux: dx / l, uy: dy / l };
 }
-// 收刀速度：前段快 → 将收未收时顿一下 → 用力收回
-function sheathEase(sp) {
-  if (sp < 0.60) { const x = sp / 0.60; const e = 1 - (1 - x) * (1 - x) * (1 - x); return 0.85 * (0.82 * e + 0.18 * x); }   // 前段快，收到将满
-  if (sp < 0.87) { const x = (sp - 0.60) / 0.27; return 0.85 + 0.05 * x; }                                                 // 顿（更久）
-  const x = (sp - 0.87) / 0.13; return 0.90 + 0.10 * (0.8 * x * x * x + 0.2 * x);                                          // 用力收回
+function axisPose(outDist) {
+  const a = sheathAxis(), L = 0.62 * H;
+  const gx = a.Mx - a.ux * outDist, gy = a.My - a.uy * outDist;
+  return { gx, gy, tx: gx + a.ux * L, ty: gy + a.uy * L };
+}
+// 刀鞘沿轴升降：拔刀时下移让位、收刀时升回原位来"接"刀（与剑同时运动）
+function scabDropPx(st) {
+  if (sword.sheathing) {                                      // 收刀：弧线段内升回原位，迎接落下的刀
+    const sp = clamp(st / SHEATH_DUR, 0, 1);
+    return (1 - smooth(0, SHEATH_ARC_END, sp)) * 0.80 * H;
+  }
+  if (st <= POP_END) return 0;
+  const dp = (st - POP_END) / (DRAW_END - POP_END);
+  const x = clamp((dp - DROP_START) / (DROP_END - DROP_START), 0, 1);
+  return x * x * 0.80 * H; // 剑掠过悬停高度时起加速坠离（与剑上提同时、幅度相称），旋转前已让出刀身
+}
+// 收刀插入进度 k(0→1)：插大半(较快) → 将收未收顿 → 用力插到底
+function sheathSlideEase(x) {
+  if (x < 0.45) { const t = x / 0.45; return 0.7 * (t * t * (3 - 2 * t)); }
+  if (x < 0.72) { const t = (x - 0.45) / 0.27; return 0.7 + 0.06 * t; }
+  const t = (x - 0.72) / 0.28; return 0.76 + 0.24 * (0.8 * t * t * t + 0.2 * t);
+}
+
+// 拔剑姿势（剑柄样条 + 刀身角度样条）与弧长均匀化：
+// ① 原始 tip 样条在起手处会掠过剑柄附近（近奇异），定长重整化后方向猛甩 —— 改为对"刀身角度"
+//    做解缠后的样条插值，关键姿势不变、转速平滑、无奇异。
+// ② 样条参数速度 ≠ 实际路程速度（各段长短不一，控制点处忽快忽慢）—— 预采样累计路程，
+//    把"路程占比"反查成参数 u，快慢完全交给 drawEase 决定。
+const ARC_N = 96;
+let drawArc = null;   // { key, poseAtU, cum, total, apexS }
+function unwrapTo(prev, a) { while (a - prev > Math.PI) a -= 2 * Math.PI; while (a - prev < -Math.PI) a += 2 * Math.PI; return a; }
+function drawArcEnsure() {
+  const key = W + 'x' + H;
+  if (drawArc && drawArc.key === key) return;
+  const ext = axisPose(EXT_OUT * H), L = 0.62 * H;   // 上挥起点 = 抽刀完成姿势（刀已离鞘）
+  const gP = [{ x: ext.gx / W, y: ext.gy / H }, GRIP_PATH[1], GRIP_PATH[2], GRIP_PATH[3]];
+  const tP = [{ x: ext.tx / W, y: ext.ty / H }, TIP_PATH[1], TIP_PATH[2], TIP_PATH[3]];
+  const thP = [];                                // 各关键姿势的刀身角（像素空间，解缠成连续序列）
+  for (let i = 0; i < 4; i++) {
+    const a = Math.atan2(tP[i].y * H - gP[i].y * H, tP[i].x * W - gP[i].x * W);
+    thP.push({ x: i ? unwrapTo(thP[i - 1].x, a) : a, y: 0 });
+  }
+  const poseAtU = (u) => {
+    const g = crPath(gP, u), a = crPath(thP, u).x;
+    const gx = g.x * W, gy = g.y * H;
+    return { gx, gy, tx: gx + Math.cos(a) * L, ty: gy + Math.sin(a) * L };
+  };
+  const cum = [0];
+  let prev = poseAtU(0);
+  for (let i = 1; i <= ARC_N; i++) {
+    const q = poseAtU(i / ARC_N);
+    cum.push(cum[i - 1] + Math.hypot(q.tx - prev.tx, q.ty - prev.ty) + Math.hypot(q.gx - prev.gx, q.gy - prev.gy));
+    prev = q;
+  }
+  const total = cum[ARC_N] || 1;
+  drawArc = { key, poseAtU, cum, total, apexS: cum[Math.round(ARC_N * 2 / 3)] / total };
+}
+function drawArcU(s) {                          // 路程占比 s → 样条参数 u
+  const c = drawArc.cum, target = clamp(s, 0, 1) * drawArc.total;
+  let lo = 1, hi = ARC_N;
+  while (lo < hi) { const m = (lo + hi) >> 1; if (c[m] < target) lo = m + 1; else hi = m; }
+  const f = c[lo] > c[lo - 1] ? (target - c[lo - 1]) / (c[lo] - c[lo - 1]) : 0;
+  return (lo - 1 + f) / ARC_N;
 }
 
 function swordPoseAt(st) {
-  const L = 0.62 * H;       // 刀身固定长度（刚体）
-  let g, t, a = 1;
-  if (sword.sheathing) {                        // 收刀：沿收刀曲线 + 速度顿挫
+  const L = 0.62 * H;
+  let g, t, P, a = 1;
+  if (sword.sheathing) {                          // 收刀（保留：空中对准鞘口 → 沿轴插入，被鞘遮住）
     const sp = clamp(st / SHEATH_DUR, 0, 1);
-    const u = sheathEase(sp);
-    g = crPath(SHEATH_G_PATH, u); t = crPath(SHEATH_T_PATH, u);
-    a = 1 - smooth(0.93, 1.0, sp);
-  } else if (st < 0.30) {                        // ① 弹鞘：剑柄弹出一点（仍大半在鞘）
-    const k = smooth(0, 0.30, st);
-    g = { x: lerp(SHEATH_G.x, GRIP_PATH[0].x, k), y: lerp(SHEATH_G.y, GRIP_PATH[0].y, k) };
-    t = { x: lerp(SHEATH_T.x, TIP_PATH[0].x, k), y: lerp(SHEATH_T.y, TIP_PATH[0].y, k) };
-  } else if (st < DRAW_END) {                    // ② 拔剑：顶部顿挫 + 加速劈下
-    const dp = (st - 0.30) / (DRAW_END - 0.30);
-    const u = drawEase(dp);
-    g = crPath(GRIP_PATH, u); t = crPath(TIP_PATH, u);
-  } else {                                        // 持剑向前 + 轻微呼吸
+    if (sp < SHEATH_ARC_END) {
+      const al = axisPose(L);
+      const gP = [{ x: ARC_FORWARD.gx, y: ARC_FORWARD.gy }, { x: ARC_DOWNLEFT.gx, y: ARC_DOWNLEFT.gy }, { x: al.gx / W, y: al.gy / H }];
+      const tP = [{ x: ARC_FORWARD.tx, y: ARC_FORWARD.ty }, { x: ARC_DOWNLEFT.tx, y: ARC_DOWNLEFT.ty }, { x: al.tx / W, y: al.ty / H }];
+      const u = smooth(0, SHEATH_ARC_END, sp);
+      g = crPath(gP, u); t = crPath(tP, u);
+      P = { gx: g.x * W, gy: g.y * H, tx: t.x * W, ty: t.y * H };
+    } else {
+      const k = sheathSlideEase((sp - SHEATH_ARC_END) / (1 - SHEATH_ARC_END));
+      P = axisPose(lerp(L, 0, k));
+    }
+    a = 1 - smooth(0.97, 1.0, sp);
+  } else if (st < POP_END) {                      // 弹鞘：剑柄沿轴弹出一截（露出刃根）
+    P = axisPose(lerp(0, POP_OUT * H, smooth(0, POP_END, st)));
+  } else if (st < DRAW_END) {                     // 拔剑：滑出→上挥→顿→斩，复合路径 + 连续速度（无分段顿挫）
+    drawArcEnsure();
+    const dp = (st - POP_END) / (DRAW_END - POP_END);
+    const LA = 2 * (EXT_OUT - POP_OUT) * H;       // 轴滑段路程（柄尖同移，与样条表的合计度量一致）
+    const TOT = LA + drawArc.total;
+    const sExt = LA / TOT;                        // 离鞘点（旋转从这里才开始）
+    const sApex = (LA + drawArc.apexS * drawArc.total) / TOT;
+    const CREEP = 0.05 * (1 - sApex);
+    let s;
+    if (dp < EXT_DP) {                            // ① 缓缓上提→加速抽出：一条连续加速曲线，掠过悬停高度不打顿
+      s = sExt * Math.pow(dp / EXT_DP, 2.4);
+    } else if (dp < APEX_DP) {                    // ② 出鞘衔接上挥：起速=抽刀末速（Hermite，C¹连续），到头顶收住
+      const x = (dp - EXT_DP) / (APEX_DP - EXT_DP), x2 = x * x, x3 = x2 * x;
+      const m0 = 2.4 * sExt / EXT_DP * (APEX_DP - EXT_DP);
+      s = sExt + (sApex - sExt) * (3 * x2 - 2 * x3) + m0 * (x - 2 * x2 + x3);
+    } else if (dp < PAUSE_DP) {                   // ③ 顿：头顶蓄力，微微续动
+      s = sApex + CREEP * (dp - APEX_DP) / (PAUSE_DP - APEX_DP);
+    } else {                                      // ④ 发力斩下
+      const x = (dp - PAUSE_DP) / (1 - PAUSE_DP);
+      s = sApex + CREEP + (1 - sApex - CREEP) * (0.8 * x * x * x + 0.2 * x);
+    }
+    P = (s <= sExt)
+      ? axisPose(lerp(POP_OUT * H, EXT_OUT * H, s / sExt))         // 轴滑段（直线路程，匀映射）
+      : drawArc.poseAtU(drawArcU((s - sExt) / (1 - sExt)));        // 样条段（弧长均匀）
+  } else {                                         // 持剑向前 + 呼吸
     const sway = Math.sin((st - DRAW_END) * 1.5 + bobT * 0.7) * 0.006;
     g = { x: GRIP_PATH[3].x + Math.sin(bobT * 0.7) * 0.004, y: GRIP_PATH[3].y };
     t = { x: TIP_PATH[3].x + sway, y: TIP_PATH[3].y + sway * 0.5 };
+    P = { gx: g.x * W, gy: g.y * H, tx: t.x * W, ty: t.y * H };
   }
-  let gx = g.x * W, gy = g.y * H, tx = t.x * W, ty = t.y * H;
+  let gx = P.gx, gy = P.gy, tx = P.tx, ty = P.ty;
   const dx = tx - gx, dy = ty - gy, dl = Math.hypot(dx, dy) || 1;   // 定长刚体
   tx = gx + dx / dl * L; ty = gy + dy / dl * L;
   return { gx, gy, tx, ty, a };
@@ -731,30 +845,50 @@ function swordPose() { return swordPoseAt(sword.t); }
 // 刀鞘（saya）：在左下，刀从鞘口滑出/归鞘
 function drawScabbard(alpha) {
   if (alpha <= 0.002) return;
-  const mx = 0.05 * W, my = 0.80 * H;     // 鞘口（朝左上，刀从此处出入）
-  const dx = 0.30 * W, dy = 1.40 * H;     // 鞘尾（贴向身体，伸出画面下方）
+  const ax = sheathAxis(), drop = scabDropPx(sword.t);   // 拔刀时刀鞘沿轴下移让位
+  const mx = SCAB_M.x * W + ax.ux * drop, my = SCAB_M.y * H + ax.uy * drop;
+  const dx = SCAB_D.x * W + ax.ux * drop, dy = SCAB_D.y * H + ax.uy * drop;
   const ang = Math.atan2(dy - my, dx - mx);
   const nx = Math.cos(ang + Math.PI / 2), ny = Math.sin(ang + Math.PI / 2);
-  const hw = 9.5;
+  const hw = 13;     // 鞘半宽：内壁贴合刀身（刀半宽 10.5 + 薄壁）
+  const BOWS = 0;    // 直鞘：刀在鞘内拉直、沿正中进出（见 bladeFree），永不越壁
+  const cmx = (mx + dx) / 2 - nx * BOWS, cmy = (my + dy) / 2 - ny * BOWS;
+  const sAt = (s) => { const u1 = 1 - s; return { x: u1 * u1 * mx + 2 * u1 * s * cmx + s * s * dx, y: u1 * u1 * my + 2 * u1 * s * cmy + s * s * dy }; };
+  const wS = (s) => hw * (1 - 0.3 * s);   // 向尾部略收
+  const NS = 14;
+  const edgeS = (k, s0, s1) => { const p = []; for (let i = 0; i <= NS; i++) { const s = s0 + (s1 - s0) * i / NS, c = sAt(s), w = wS(s) * k; p.push({ x: c.x + nx * w, y: c.y + ny * w }); } return p; };
+  const ringS = (A, B) => { ctx.beginPath(); A.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); for (let i = B.length - 1; i >= 0; i--) ctx.lineTo(B[i].x, B[i].y); ctx.closePath(); };
   ctx.save();
   ctx.globalAlpha = alpha;
+  ringS(edgeS(1, 0, 1), edgeS(-1, 0, 1));                            // 鞘身
+  ctx.fillStyle = '#a31020';                                         // 主面：红色平涂（矩形截面）
+  ctx.fill();
+  ringS(edgeS(-0.55, 0, 1), edgeS(-1, 0, 1));                        // 侧面窄条：硬边折面 → 矩形截面感
+  ctx.fillStyle = '#6e0812';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(255,190,196,0.42)'; ctx.lineWidth = 1.2;   // 受光上棱（硬棱线）
   ctx.beginPath();
-  ctx.moveTo(mx + nx * hw, my + ny * hw);
-  ctx.lineTo(dx + nx * hw * 0.7, dy + ny * hw * 0.7);
-  ctx.lineTo(dx - nx * hw * 0.7, dy - ny * hw * 0.7);
-  ctx.lineTo(mx - nx * hw, my - ny * hw);
-  ctx.closePath();
-  const g = ctx.createLinearGradient(mx + nx * hw, my + ny * hw, mx - nx * hw, my - ny * hw);
-  g.addColorStop(0, '#05060a'); g.addColorStop(0.45, '#1c2330'); g.addColorStop(0.55, '#232b39'); g.addColorStop(1, '#05060a');
-  ctx.fillStyle = g; ctx.fill();
-  ctx.strokeStyle = 'rgba(150,180,225,0.22)'; ctx.lineWidth = 1.2;  // 月光描边
-  ctx.beginPath(); ctx.moveTo(mx - nx * hw, my - ny * hw); ctx.lineTo(dx - nx * hw * 0.7, dy - ny * hw * 0.7); ctx.stroke();
-  ctx.strokeStyle = 'rgba(205,175,115,0.55)'; ctx.lineWidth = 3;    // 鞘口金具
+  edgeS(1, 0, 1).forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y));
+  ctx.stroke();
+  ringS(edgeS(1, 0.8, 1), edgeS(-1, 0.8, 1));                        // 鞘尾黑段（基本在画面外，按规格保留）
+  ctx.fillStyle = '#120a0d';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(246,242,236,0.92)'; ctx.lineWidth = 3.5;   // 鞘口（koiguchi）白饰
   ctx.beginPath(); ctx.moveTo(mx + nx * hw, my + ny * hw); ctx.lineTo(mx - nx * hw, my - ny * hw); ctx.stroke();
   ctx.restore();
 }
 function mix(A, B, k) {
   return { gx: lerp(A.gx, B.gx, k), gy: lerp(A.gy, B.gy, k), tx: lerp(A.tx, B.tx, k), ty: lerp(A.ty, B.ty, k) };
+}
+// 刀身弧度系数：鞘内/出入鞘时拉直（沿鞘正中进出、绝不越壁），完全离鞘后弧度才显现
+function bladeFree() {
+  if (sword.sheathing) {
+    const sp = clamp(sword.t / SHEATH_DUR, 0, 1);
+    return 1 - smooth(SHEATH_ARC_END - 0.08, SHEATH_ARC_END, sp);   // 对准鞘口入鞘时拉直
+  }
+  if (sword.t <= POP_END) return 0;
+  const dp = (sword.t - POP_END) / (DRAW_END - POP_END);
+  return smooth(EXT_DP, EXT_DP + 0.10, dp);                          // 离鞘甩起时弧度显现
 }
 function drawSword() {
   if (!sword.active) return;
@@ -766,7 +900,7 @@ function drawSword() {
   const ux = Math.cos(ang), uy = Math.sin(ang);
 
   // 挥剑/收刀弧光：采样最近若干帧的剑尖，连成渐隐弧形拖影（弧度感 / 动态模糊）
-  if ((!sword.sheathing && sword.t > 0.34 && sword.t < 1.5) || sword.sheathing) {
+  if ((!sword.sheathing && sword.t > 0.34 && sword.t < DRAW_END + 0.15) || sword.sheathing) {
     const pts = [{ x: tx, y: ty }];
     for (let k = 1; k <= 7; k++) { const st = sword.t - k * 0.045; if (st < 0.02) break; const Q = swordPoseAt(st); pts.push({ x: Q.tx, y: Q.ty }); }
     if (pts.length > 2) {
@@ -785,76 +919,124 @@ function drawSword() {
   ctx.save();
   ctx.globalAlpha = P.a;
 
-  // --- handle (foreground, near grip) ---
-  const hbx = gx + ux * 4, hby = gy + uy * 4;
-  ctx.strokeStyle = '#1c140e';
-  ctx.lineWidth = 13; ctx.lineCap = 'round';
-  ctx.beginPath(); ctx.moveTo(gx - ux * 38, gy - uy * 38); ctx.lineTo(hbx, hby); ctx.stroke();
-  ctx.strokeStyle = 'rgba(150,110,70,0.5)';
-  ctx.lineWidth = 1.2;
-  for (let i = 0; i < 5; i++) {
-    const f = i / 5;
-    const px = lerp(gx - ux * 36, hbx, f), py = lerp(gy - uy * 36, hby, f);
-    ctx.beginPath(); ctx.moveTo(px - nx * 6, py - ny * 6); ctx.lineTo(px + nx * 6, py + ny * 6); ctx.stroke();
-  }
-  // --- guard (tsuba) ---
-  ctx.fillStyle = '#2a2118';
-  ctx.beginPath();
-  ctx.ellipse(gx + ux * 6, gy + uy * 6, 4, 15, ang, 0, Math.PI * 2);
-  ctx.fill();
-  ctx.strokeStyle = 'rgba(200,170,110,0.5)'; ctx.lineWidth = 1; ctx.stroke();
-
-  // --- blade: tapered, slightly curved (katana) ---
-  const baseW = 9, tipW = 1.2;
-  const curve = 16; // curvature bow
-  const mx = (gx + tx) / 2 + nx * curve, my = (gy + ty) / 2 + ny * curve;
-  // outline via quadratic on both edges
-  ctx.beginPath();
-  ctx.moveTo(gx + nx * baseW, gy + ny * baseW);
-  ctx.quadraticCurveTo(mx + nx * (baseW * 0.5), my + ny * (baseW * 0.5), tx + nx * tipW, ty + ny * tipW);
-  ctx.lineTo(tx - nx * tipW, ty - ny * tipW);
-  ctx.quadraticCurveTo(mx - nx * (baseW * 0.5), my - ny * (baseW * 0.5), gx - nx * baseW, gy - ny * baseW);
-  ctx.closePath();
+  // --- blade：打刀——全长等宽；切先：刀背直抵尖端、刃口圆弧渐进收尖。
+  //     刃口固定在 −n 侧：出鞘前就朝好方向，斩下时弧面自然朝下（全程不翻转）---
+  const bw = 10.5, KISS = 0.86, curve = 8 * bladeFree();
+  const enx = -nx, eny = -ny;
+  const mx = (gx + tx) / 2 + enx * curve, my = (gy + ty) / 2 + eny * curve;
+  const cAt = (s) => { const u1 = 1 - s; return { x: u1 * u1 * gx + 2 * u1 * s * mx + s * s * tx, y: u1 * u1 * gy + 2 * u1 * s * my + s * s * ty }; };
+  const oE = (s) => { if (s < KISS) return bw; const q = (s - KISS) / (1 - KISS); return bw * (1 - 2 * Math.pow(q, 2.2)); };
+  const off = (k, s) => -bw + k * (oE(s) + bw);                     // k：0=刀背 → 1=刃口（全部收敛于背侧尖端）
+  const NB = 36;
+  const lineAt = (k) => { const p = []; for (let i = 0; i <= NB; i++) { const s = i / NB, c = cAt(s), w = off(k, s); p.push({ x: c.x + enx * w, y: c.y + eny * w }); } return p; };
+  const ptsS = lineAt(0), ptsB = lineAt(0.35), ptsM = lineAt(0.78), ptsE = lineAt(1);
+  const ring = (A, B) => { ctx.beginPath(); A.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); for (let i = NB; i >= 0; i--) ctx.lineTo(B[i].x, B[i].y); ctx.closePath(); };
+  const poly = (A) => { ctx.beginPath(); A.forEach((p, i) => i ? ctx.lineTo(p.x, p.y) : ctx.moveTo(p.x, p.y)); };
+  ring(ptsE, ptsS);                                                 // 刀身整体
   const blade = ctx.createLinearGradient(gx, gy, tx, ty);
-  blade.addColorStop(0, '#3a4654');
-  blade.addColorStop(0.5, '#566576');
-  blade.addColorStop(1, '#8a9bb0');
+  blade.addColorStop(0, '#aeb8c4');
+  blade.addColorStop(0.5, '#d6dee8');
+  blade.addColorStop(1, '#f5f9fd');
   ctx.fillStyle = blade;
   ctx.fill();
-  // moonlit edge highlight
-  ctx.strokeStyle = 'rgba(225,238,255,0.85)';
+  ring(ptsB, ptsS);                                                 // 背侧斜面压暗（镐线分出两个面）
+  ctx.fillStyle = 'rgba(20,28,40,0.30)';
+  ctx.fill();
+  ring(ptsE, ptsM);                                                 // 刃侧斜面提亮（抛光刃区）
+  ctx.fillStyle = 'rgba(255,255,255,0.15)';
+  ctx.fill();
+  ctx.strokeStyle = 'rgba(240,247,255,0.95)';                       // 刃口高光
   ctx.lineWidth = 1.4;
+  poly(ptsE); ctx.stroke();
+  ctx.strokeStyle = 'rgba(18,24,32,0.5)';                           // 刀背暗线
+  ctx.lineWidth = 1.1;
+  poly(ptsS); ctx.stroke();
+  // 常驻刃面反光（镐线）：剑在手中就一直亮着（微呼吸），不随挥剑结束而消失
+  const shimmer = 0.78 + 0.22 * Math.sin(bobT * 1.4);
+  ctx.save();
+  ctx.globalCompositeOperation = 'lighter';
+  ctx.strokeStyle = `rgba(215,232,252,${0.18 * shimmer})`;          // 柔光晕
+  ctx.lineWidth = 5.5;
+  poly(ptsM); ctx.stroke();
+  ctx.strokeStyle = `rgba(248,252,255,${0.85 * shimmer})`;          // 反光亮芯
+  ctx.lineWidth = 2.2;
+  poly(ptsM); ctx.stroke();
+  // 刃根高光：出鞘可见段的常亮反光（弹鞘/悬停状态从镡口冒出就能看到）
+  const so = off(0.78, 0) * 0.9;
+  ctx.strokeStyle = `rgba(255,255,255,${0.85 * shimmer})`;
+  ctx.lineWidth = 2.6;
   ctx.beginPath();
-  ctx.moveTo(gx + nx * baseW, gy + ny * baseW);
-  ctx.quadraticCurveTo(mx + nx * (baseW * 0.5), my + ny * (baseW * 0.5), tx + nx * tipW, ty + ny * tipW);
+  ctx.moveTo(gx + ux * 20 + enx * so, gy + uy * 20 + eny * so);
+  ctx.lineTo(gx + ux * 66 + enx * so * 0.7, gy + uy * 66 + eny * so * 0.7);
   ctx.stroke();
-  // spine shadow line
-  ctx.strokeStyle = 'rgba(10,16,24,0.6)';
-  ctx.lineWidth = 1;
+  // 刃根流光：一道亮光沿刃根反复滑过、没入鞘口（让"在反光"一眼可见）
+  const swp = (bobT * 0.5) % 1;
+  const swc = 20 + swp * 56, swa = Math.sin(swp * Math.PI);
+  ctx.strokeStyle = `rgba(255,255,255,${0.95 * swa})`;
+  ctx.lineWidth = 3.2;
   ctx.beginPath();
-  ctx.moveTo(gx - nx * baseW * 0.6, gy - ny * baseW * 0.6);
-  ctx.quadraticCurveTo(mx - nx * baseW * 0.3, my - ny * baseW * 0.3, tx - nx * tipW, ty - ny * tipW);
+  ctx.moveTo(gx + ux * (swc - 9) + enx * so, gy + uy * (swc - 9) + eny * so);
+  ctx.lineTo(gx + ux * (swc + 9) + enx * so * 0.8, gy + uy * (swc + 9) + eny * so * 0.8);
   ctx.stroke();
+  ctx.restore();
 
-  // --- travelling glint after the swing ---
-  if (!sword.sheathing && sword.t > 1.42) {
+  // --- travelling glint：刀在外时持续巡走的反光（弹鞘停住时也在闪）---
+  if (!sword.sheathing && sword.t > POP_END * 0.7) {
     sword.glint += 0.016;
     const gp = (sword.glint % 2.2) / 1.0;
     if (gp <= 1) {
       const gx2 = lerp(gx, tx, gp), gy2 = lerp(gy, ty, gp);
       const a = Math.sin(gp * Math.PI);
       ctx.fillStyle = `rgba(255,255,255,${0.9 * a})`;
-      ctx.beginPath(); ctx.ellipse(gx2 + nx * baseW * (1 - gp), gy2 + ny * baseW * (1 - gp), 3, 6, ang, 0, Math.PI * 2); ctx.fill();
+      ctx.beginPath(); ctx.ellipse(gx2 + enx * bw * 0.7, gy2 + eny * bw * 0.7, 3, 6, ang, 0, Math.PI * 2); ctx.fill();
     }
   }
+
+  // --- handle（村雨风：修长红柄平头尾，中段白色矩形留白区，两端红段缀 X 纹）——画在刀身之上 ---
+  const hbx = gx + ux * 6, hby = gy + uy * 6;
+  const bx = gx - ux * 115, by = gy - uy * 115;                 // 柄尾（修长）
+  ctx.strokeStyle = '#ad1422';
+  ctx.lineWidth = 24; ctx.lineCap = 'butt';                     // 柄宽 = 1.2×；平头：尾端平切
+  ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(hbx, hby); ctx.stroke();
+  ctx.strokeStyle = '#f5f1ea';                                  // 中段白色矩形区（留白，无字符，加长）
+  ctx.lineWidth = 14;
+  ctx.beginPath();
+  ctx.moveTo(lerp(bx, hbx, 0.18), lerp(by, hby, 0.18));
+  ctx.lineTo(lerp(bx, hbx, 0.82), lerp(by, hby, 0.82));
+  ctx.stroke();
+  ctx.strokeStyle = 'rgba(88,6,14,0.8)';                        // 红段 X 缠纹
+  ctx.lineWidth = 1.9; ctx.lineCap = 'round';
+  for (const f of [0.04, 0.10, 0.16, 0.84, 0.90, 0.96]) {
+    const px = lerp(bx, hbx, f), py = lerp(by, hby, f), o = 3.8;
+    ctx.beginPath();
+    ctx.moveTo(px - nx * 9.5 - ux * o, py - ny * 9.5 - uy * o); ctx.lineTo(px + nx * 9.5 + ux * o, py + ny * 9.5 + uy * o);
+    ctx.moveTo(px - nx * 9.5 + ux * o, py - ny * 9.5 + uy * o); ctx.lineTo(px + nx * 9.5 - ux * o, py + ny * 9.5 - uy * o);
+    ctx.stroke();
+  }
+  ctx.strokeStyle = '#7a0d19';                                  // 柄头：扁平帽（平切面）
+  ctx.lineWidth = 24; ctx.lineCap = 'butt';
+  ctx.beginPath(); ctx.moveTo(bx, by); ctx.lineTo(bx + ux * 8.5, by + uy * 8.5); ctx.stroke();
+  ctx.strokeStyle = 'rgba(228,234,242,0.5)'; ctx.lineWidth = 1.3;   // 尾端银线
+  ctx.beginPath(); ctx.moveTo(bx + nx * 12, by + ny * 12); ctx.lineTo(bx - nx * 12, by - ny * 12); ctx.stroke();
+  // --- guard（tsuba：村雨式矩形）——盖在刀身上，把刀身包进去 ---
+  const tcx = gx + ux * 8, tcy = gy + uy * 8, ta = 8, tb = 22;
+  ctx.fillStyle = '#8a0f1c';
+  ctx.beginPath();
+  ctx.moveTo(tcx + ux * ta + nx * tb, tcy + uy * ta + ny * tb);
+  ctx.lineTo(tcx + ux * ta - nx * tb, tcy + uy * ta - ny * tb);
+  ctx.lineTo(tcx - ux * ta - nx * tb, tcy - uy * ta - ny * tb);
+  ctx.lineTo(tcx - ux * ta + nx * tb, tcy - uy * ta + ny * tb);
+  ctx.closePath(); ctx.fill();
+  ctx.strokeStyle = 'rgba(228,234,242,0.6)'; ctx.lineWidth = 1.2; ctx.stroke();
   ctx.restore();
   // 鞘：画在刀之后 → 遮住仍在鞘内的部分，形成出鞘/归鞘
   drawScabbard(sword.sheathing ? P.a : 1);
 
-  // ① 弹鞘：鞘口冒光反光（剑柄弹出的瞬间）
-  if (!sword.sheathing && sword.t < 0.32) {
-    const fl = Math.sin(smooth(0, 0.32, sword.t) * Math.PI);   // 0→1→0
-    const mx = 0.05 * W, my = 0.80 * H;
+  // ① 弹鞘：鞘口星芒闪光——弹出亮起后持续闪烁（与收刀"将收未收"的冒光同款），第二击拔剑才熄
+  if (!sword.sheathing && sword.t < POP_END + 0.06) {
+    const tw = 0.70 + 0.30 * Math.sin(bobT * 2.6);             // 闪烁
+    const fl = smooth(0, 0.26, sword.t) * (1 - smooth(POP_END + 0.005, POP_END + 0.06, sword.t)) * tw;
+    const mx = SCAB_M.x * W, my = SCAB_M.y * H;
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
     const fg = ctx.createRadialGradient(mx, my, 0, mx, my, 44);
@@ -874,9 +1056,9 @@ function drawSword() {
   // 收刀：将收未收时冒一下光（鞘口）
   if (sword.sheathing) {
     const sp = sword.t / SHEATH_DUR;
-    if (sp > 0.62 && sp < 0.90) {
-      const fl = Math.sin(smooth(0.62, 0.76, sp) * Math.PI * 0.5) * (1 - smooth(0.84, 0.90, sp));
-      const mx = 0.05 * W, my = 0.80 * H;
+    if (sp > 0.70 && sp < 0.93) {
+      const fl = Math.sin(smooth(0.70, 0.80, sp) * Math.PI * 0.5) * (1 - smooth(0.88, 0.93, sp));
+      const mx = SCAB_M.x * W, my = SCAB_M.y * H;
       ctx.save();
       ctx.globalCompositeOperation = 'lighter';
       const fg = ctx.createRadialGradient(mx, my, 0, mx, my, 42);
@@ -982,38 +1164,69 @@ function checkCombatEnd() {            // 墙钟判定到点（前台/后台/切
     if ('Notification' in window && Notification.permission === 'granted') {
       try { new Notification('雨落笙歌起', { body: '时已尽 · 雨复落' }); } catch (e) {}
     }
-    setMode('cruise');
+    autoReturnCruise();
   }
 }
 
-function setMode(m) {
-  if (m === mode) return;
-  const from = mode;
-  mode = m;
-  if (m === 'cruise') {
-    if (from === 'combat') {
-      rain.state = 'awaitSheath';   // 收刀入鞘那一瞬 → 骤雨倾落
-    } else {
-      rain.state = 'intro'; rain.t = 0; rain.amount = 0.15; rain.speedMul = 0.16;
-    }
-    setSword(false);
-    stopKeepAlive(); releaseWakeLock();
-  } else {
-    combatRemainMs = 30 * 60 * 1000;
-    combatEndAt = guard ? 0 : Date.now() + combatRemainMs;   // 墙钟结束点
-    rain.state = 'fadeout';
-    setSword(true);
-    ensureAudio(); startKeepAlive(); requestWakeLock();
-    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
-  }
-  btnCruise.classList.toggle('active', m === 'cruise');
-  btnCombat.classList.toggle('active', m === 'combat');
+// ---- 两段式切换：每个模式按钮点两下，按钮颜色分级渐变 ----
+let phase = 'cruise';                 // 'cruise' | 'arming' | 'combat' | 'sheathing'
+const POP_CAP = POP_END;              // 弹鞘结束（拔剑第一段暂停点）
+const HANG_CAP = 0.78 * SHEATH_DUR;   // 收刀"将收未收"停顿点
+
+function setModeButtons() {
+  btnCombat.classList.toggle('active', phase === 'combat');
+  btnCombat.classList.toggle('half', phase === 'arming');
+  btnCruise.classList.toggle('active', phase === 'cruise');
+  btnCruise.classList.toggle('half', phase === 'sheathing');
   elTitle.style.opacity = '0.32';
+}
+
+function onCombatClick() {
+  if (phase === 'combat') return;
+  if (phase === 'arming') {                 // 第二下：拔剑→举顶→挥下（连贯）
+    phase = 'combat'; mode = 'combat';
+    sword.cap = Infinity;
+    combatRemainMs = 30 * 60 * 1000;
+    combatEndAt = guard ? 0 : Date.now() + combatRemainMs;
+    startKeepAlive(); requestWakeLock();
+    if ('Notification' in window && Notification.permission === 'default') Notification.requestPermission().catch(() => {});
+  } else {                                   // 第一下：弹鞘 + 骤雨停下
+    phase = 'arming'; mode = 'combat';
+    combatEndAt = 0;
+    rain.state = 'fadeout';
+    ensureAudio();
+    setSword(true, POP_CAP);
+  }
+  setModeButtons();
+}
+
+function onCruiseClick() {
+  if (phase === 'cruise') return;
+  if (phase === 'sheathing') {              // 第二下：插到底 + 慢动作雨瞬间倾落
+    phase = 'cruise'; mode = 'cruise';
+    sword.cap = Infinity;                    // 释放 → 到 home → awaitSheath 触发骤雨
+  } else {                                   // 第一下：收刀到"将收未收" + 雨引下→慢动作
+    phase = 'sheathing'; mode = 'cruise';
+    combatEndAt = 0;
+    stopKeepAlive(); releaseWakeLock();
+    rain.state = 'awaitSheath';
+    setSword(false, HANG_CAP);
+  }
+  setModeButtons();
+}
+
+function autoReturnCruise() {               // 战斗到点：自动一气呵成收刀回巡航
+  phase = 'cruise'; mode = 'cruise';
+  combatEndAt = 0;
+  stopKeepAlive(); releaseWakeLock();
+  rain.state = 'awaitSheath';
+  setSword(false, Infinity);
+  setModeButtons();
 }
 function toggleGuard() {
   guard = !guard;
   btnGuard.classList.toggle('active', guard);
-  if (mode === 'combat') {
+  if (phase === 'combat') {
     if (guard) { if (combatEndAt) combatRemainMs = combatEndAt - Date.now(); combatEndAt = 0; }   // 暂停倒计时
     else { combatEndAt = Date.now() + Math.max(0, combatRemainMs); }                                // 恢复倒计时
   }
@@ -1036,15 +1249,15 @@ function cycleHint(dt) {
   }
 }
 
-btnCruise.addEventListener('click', () => setMode('cruise'));
-btnCombat.addEventListener('click', () => setMode('combat'));
+btnCruise.addEventListener('click', onCruiseClick);
+btnCombat.addEventListener('click', onCombatClick);
 btnGuard.addEventListener('click', toggleGuard);
 
 let titleHidden = false;
 function updateStatus(dt) {
   checkCombatEnd();   // 墙钟判定到点（切后台不丢时间）
   let txt = '', cls = '';
-  if (mode === 'combat') {
+  if (phase === 'combat') {
     if (guard) { txt = '守护中 · ∞'; cls = 'guard'; }
     else {
       const s = Math.max(0, Math.ceil(combatRemainingSec()));
@@ -1079,6 +1292,7 @@ function frame(now) {
   // sword timeline
   if (sword.active) {
     sword.t += dt;
+    if (sword.t > sword.cap) sword.t = sword.cap;     // 停在暂停点
     if (sword.sheathing && sword.t > SHEATH_DUR + 0.04) sword.active = false;
   }
 
@@ -1116,6 +1330,7 @@ resize();
 buildDrops();
 buildWake();
 updateHint();
+setModeButtons();
 requestAnimationFrame(frame);
 </script>
 </body>
